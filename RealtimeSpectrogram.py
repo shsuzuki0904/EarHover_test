@@ -1,71 +1,71 @@
-import sys
+from matplotlib.animation import FuncAnimation
+import matplotlib.pyplot as plt
 import numpy as np
-import pyqtgraph as pg
-import pyaudio
-import librosa
-from pyqtgraph.Qt import QtWidgets, QtCore
+import rtmixer
+import math
+import sounddevice as sd
 
-class RealTimeMelSpectrogram:
-    def __init__(self, 
-                 sr=44100, 
-                 n_mels=128, 
-                 n_fft=2048, 
-                 hop_length=512
-        ):
-        self.sr = sr
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.hop_length = hop_length
+FRAMES_PER_BUFFER = 512
+NFFT = 4096
+NOVERLAP = 128
 
-        # Initialize PyAudio
-        self.p = pyaudio.PyAudio()
-        self.stream = self.p.open(format=pyaudio.paFloat32, channels=1, rate=self.sr, input=True, frames_per_buffer=self.hop_length, stream_callback=self.callback)
+window = 100000
+downsample = 10  
+channels = 1
 
-        # Initialize PyQtGraph
-        self.app = QtWidgets.QApplication([])
-        self.win = pg.GraphicsLayoutWidget(show=True, title="Real-Time Mel Spectrogram")
-        self.plot = self.win.addPlot()
-        self.image = pg.ImageItem(axisOrder='row-major')
-        self.plot.addItem(self.image)
-        self.plot.setLabel('left', 'Frequency', units='Hz')
-        self.plot.setLabel('bottom', 'Time', units='s')
-        self.plot.setXRange(0, 3)  # Time axis from 0 to 3 seconds
-        self.plot.setYRange(0, 100)  # Frequency axis from 0 to 100 Hz
+def create_specgram(frame):
+    global plotdata
+    
+    spec, freqs, t = plt.mlab.specgram(plotdata[:,-1], Fs=samplerate)
+    xmin, xmax = np.min(t) - pad_xextent, np.max(t) + pad_xextent
+    extent = xmin, xmax, freqs[0], freqs[-1]
+    arr = np.flipud(10. * np.log10(spec))
 
-        # Create a colormap
-        self.cmap = pg.colormap.get('viridis', source='matplotlib')
-        self.image.setLookupTable(self.cmap.getLookupTable())
+    return arr, extent
 
-        # Prepare the data buffer
-        self.spec_data = np.zeros((int(3 * self.sr / self.hop_length), self.n_mels))
+def update_plot(frame):
 
-        # Start the update timer
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update)
-        self.timer.start(50)
+    global plotdata
 
-    def callback(self, in_data, frame_count, time_info, status):
-        audio_data = np.frombuffer(in_data, dtype=np.float32)
-        S = librosa.feature.melspectrogram(y=audio_data, sr=self.sr, n_fft=self.n_fft, hop_length=self.hop_length, n_mels=self.n_mels, fmax=100)
-        S_db = librosa.power_to_db(S, ref=np.max)
-        self.spec_data = np.roll(self.spec_data, -1, axis=0)
-        self.spec_data[-1, :] = S_db[:, 0]
-        return (in_data, pyaudio.paContinue)
+    while ringBuffer.read_available >= FRAMES_PER_BUFFER:
+        read, buf1, buf2 = ringBuffer.get_read_buffers(FRAMES_PER_BUFFER)
+        assert read == FRAMES_PER_BUFFER
+        buffer = np.frombuffer(buf1, dtype='float32')
+        buffer.shape = -1, channels
+        buffer = buffer[::downsample]
 
-    def update(self):
-        self.image.setImage(self.spec_data.T, autoLevels=False, levels=(self.spec_data.min(), self.spec_data.max()))
-        QtWidgets.QApplication.processEvents()
+        assert buffer.base.base == buf1
+        shift = len(buffer)
+        plotdata = np.roll(plotdata, -shift, axis=0)
+        plotdata[-shift:, :] = buffer
+        ringBuffer.advance_read_index(FRAMES_PER_BUFFER)
 
-    def start(self):
-        self.stream.start_stream()
-        if (sys.flags.interactive != 1) or not hasattr(QtCore, 'PYQT_VERSION'):
-            QtWidgets.QApplication.instance().exec_()
+    arr, _  = create_specgram(frame)
+    image.set_array(arr)
+    return image,
 
-    def close(self):
-        self.stream.stop_stream()
-        self.stream.close()
-        self.p.terminate()
+device_info = sd.query_devices(device=None, kind='input')
+samplerate = device_info['default_samplerate']
 
-if __name__ == '__main__':
-    spectrogram = RealTimeMelSpectrogram()
-    spectrogram.start()
+pad_xextent = (NFFT - NOVERLAP) / samplerate / 2
+length = int(window * samplerate / (1000 * downsample))
+plotdata = np.zeros((length, channels))
+
+stream = rtmixer.Recorder(device=None, channels=channels, blocksize=FRAMES_PER_BUFFER,
+                          latency='low', samplerate=samplerate)
+
+ringbufferSize = 2**int(math.log2(3 * samplerate))
+
+ringBuffer = rtmixer.RingBuffer(channels * stream.samplesize, ringbufferSize)
+
+fig, ax = plt.subplots(figsize=(10, 5))
+arr, extent = create_specgram(0)
+image = plt.imshow(arr, animated=True, extent=extent, aspect='auto')
+fig.colorbar(image)
+
+ani = FuncAnimation(fig, update_plot, interval=1, blit=True, cache_frame_data=False)           
+
+with stream:
+    ringBuffer = rtmixer.RingBuffer(channels * stream.samplesize, ringbufferSize)
+    action = stream.record_ringbuffer(ringBuffer)
+    plt.show()
